@@ -42,10 +42,26 @@ ikke testet mod en rigtig besked fra jeres feed. Hvis felter mangler
 eller ser forkerte ud: sæt `dump_raw_xml: true`, kør add-on'et, og
 send eksempler på den rå XML videre, så justeres parseren.
 
-## Kendte begrænsninger (v0.1.0)
+## Sensorer og kort
+
+- **Én sensor pr. hændelse** (situation) i Home Assistant, uanset hvor
+  mange DATEX II-underrecords (Accident/RoadOrCarriagewayOrLaneManagement/
+  Conditions/osv.) den består af. Alle underrecords ligger som en liste
+  i sensorens `records`-attribut.
+- Koordinater publiceres som **tekst i fuld original præcision** i
+  sensorens attributter (`latitude`/`longitude`), så Home Assistants
+  frontend ikke afrunder dem ved visning.
+- Aktive hændelser med kendte koordinater vises desuden automatisk på
+  Home Assistants **indbyggede kort-dashboard** (Oversigt → Kort, eller
+  en Map-widget) — de oprettes som `device_tracker`-entiteter og
+  fjernes igen automatisk når hændelsen lukkes.
+
+## Kendte begrænsninger (v0.2.0)
 
 - Ingen geografisk filtrering — alle hændelser fra feedet publiceres
-- Ingen automatisk oprydning af sensorer for hændelser, der har været
-  lukkede i lang tid
 - State genoprettes ikke fra en gemt tilstand ved genstart — kun nye
   beskeder fra feedet efter start
+- `device_tracker`-tilgangen til kortvisning er en pragmatisk løsning
+  (der findes ikke en MQTT-discovery-type til generelle geografiske
+  markører) — virker fint til formålet, men entiteterne optræder
+  teknisk set som "trackere" i HA's entitetsliste
