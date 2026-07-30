@@ -125,20 +125,43 @@ class TrafficEvent:
         return "".join(c if c.isalnum() else "_" for c in rid)
 
 
-def parse_datex_message(body: bytes) -> list[TrafficEvent]:
-    """Parser en DATEX II XML-besked og returnerer en liste af hændelser.
+def parse_close_notifications(root: ET.Element) -> list[str]:
+    """Parser en 'informationManagement'-luk-notifikation.
+
+    Vejdirektoratet sender ind imellem en kort besked uden en fuld
+    situation/situationRecord — kun en reference til at en tidligere
+    udsendt situation nu er lukket. Returnerer situation-id'erne der
+    er markeret som lukkede i denne besked (tom liste hvis ingen).
+    """
+    closed_situation_ids: list[str] = []
+    for element_ref in _find_all(root, "elementReference"):
+        status = _first_text(element_ref, "managementStatus")
+        if status != "closed":
+            continue
+        for ref in _find_all(element_ref, "reference"):
+            situation_id = ref.get("id")
+            if situation_id:
+                closed_situation_ids.append(situation_id)
+    return closed_situation_ids
+
+
+def parse_datex_root(body: bytes) -> Optional[ET.Element]:
+    """Parser XML-bytes til et ElementTree-rodelement, eller None ved fejl."""
+    try:
+        return ET.fromstring(body)
+    except ET.ParseError as exc:
+        log.warning("Kunne ikke parse besked som XML: %s", exc)
+        return None
+
+
+def parse_datex_message(root: ET.Element) -> list[TrafficEvent]:
+    """Udtrækker hændelser fra et allerede parset DATEX II-rodelement.
 
     En besked kan indeholde flere 'situation'-elementer, som hver kan
     indeholde flere 'situationRecord'-elementer (fx flere vejbaner
     berørt af samme hændelse).
     """
     events: list[TrafficEvent] = []
-    try:
-        root = ET.fromstring(body)
-    except ET.ParseError as exc:
-        log.warning("Kunne ikke parse besked som XML: %s", exc)
-        return events
-
     situations = _find_all(root, "situation")
     if not situations:
         # Nogle beskeder kan være en enkelt situationRecord uden en
@@ -200,6 +223,9 @@ class HaMqttPublisher:
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self._known_ids: set[str] = set()
+        # situation_id -> {record uid, ...}, så en luk-notifikation for en
+        # situation kan opdatere alle dens tilhørende sensorer
+        self._situation_records: dict[str, set[str]] = {}
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -250,6 +276,9 @@ class HaMqttPublisher:
         state_topic = f"{self.base_topic}/{uid}/state"
         attr_topic = f"{self.base_topic}/{uid}/attributes"
 
+        if event.situation_id:
+            self._situation_records.setdefault(event.situation_id, set()).add(uid)
+
         state = "active" if event.is_active else "closed"
         attributes = {
             "situation_id": event.situation_id,
@@ -270,6 +299,26 @@ class HaMqttPublisher:
             "Publicerede hændelse %s (%s) status=%s",
             uid, event.record_type, state,
         )
+
+    def close_situation(self, situation_id: str):
+        """Marker alle sensorer for en given situation som lukkede.
+
+        Bruges når Vejdirektoratet sender en 'informationManagement'
+        luk-notifikation uden en fuld situationRecord. Hvis vi ikke
+        har set situationen før (fx efter en genstart af broen), er
+        der ikke noget at gøre — sensoren blev aldrig oprettet.
+        """
+        uids = self._situation_records.get(situation_id)
+        if not uids:
+            log.debug(
+                "Luk-notifikation for ukendt situation %s (ingen sensorer at opdatere)",
+                situation_id,
+            )
+            return
+        for uid in uids:
+            state_topic = f"{self.base_topic}/{uid}/state"
+            self.client.publish(state_topic, "closed", retain=True)
+        log.info("Lukkede %d sensor(er) for situation %s", len(uids), situation_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -330,15 +379,26 @@ def run(config_path: str):
                             body = b"".join(msg.body) if hasattr(msg, "body") else bytes(msg)
                             if dump_raw_xml:
                                 log.debug("Rå DATEX II XML:\n%s", body.decode("utf-8", "replace"))
-                            events = parse_datex_message(body)
-                            if not events:
+                            root = parse_datex_root(body)
+                            if root is None:
+                                receiver.complete_message(msg)
+                                continue
+
+                            events = parse_datex_message(root)
+                            closed_situation_ids = parse_close_notifications(root)
+
+                            for event in events:
+                                publisher.publish_event(event)
+                            for situation_id in closed_situation_ids:
+                                publisher.close_situation(situation_id)
+
+                            if not events and not closed_situation_ids:
                                 log.warning(
-                                    "Ingen hændelser fundet i besked — sæt "
+                                    "Ukendt beskedformat — hverken hændelser "
+                                    "eller luk-notifikation fundet. Sæt "
                                     "dump_raw_xml: true i opsætningen for at "
                                     "undersøge strukturen."
                                 )
-                            for event in events:
-                                publisher.publish_event(event)
                             receiver.complete_message(msg)
                         except Exception:
                             log.exception("Fejl under behandling af besked — springer over")
