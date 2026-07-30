@@ -1,0 +1,52 @@
+name: "VD Trafikhændelser"
+version: "0.1.0"
+slug: "vd_traffic_ha"
+description: "Modtager Vejdirektoratets trafikhændelser via AMQP og publicerer dem til MQTT med Home Assistant auto-discovery"
+url: "https://github.com/rw-johansen/vd-traffic-ha-addon"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+init: false
+options:
+  azure:
+    tenant_id: ""
+    client_id: ""
+    client_secret: ""
+    fully_qualified_namespace: "sb-duvproddistribution.servicebus.windows.net"
+    topic_name: "t-distribution-415"
+    subscription_name: ""
+  mqtt:
+    host: ""
+    port: 1883
+    username: ""
+    password: ""
+    base_topic: "vejdirektoratet/traffic"
+    discovery_prefix: "homeassistant"
+    client_id: "vd-traffic-bridge"
+  logging:
+    level: "info"
+    dump_raw_xml: false
+schema:
+  azure:
+    tenant_id: "str"
+    client_id: "str"
+    client_secret: "password"
+    fully_qualified_namespace: "str"
+    topic_name: "str"
+    subscription_name: "str"
+  mqtt:
+    host: "str"
+    port: "port"
+    username: "str?"
+    password: "password?"
+    base_topic: "str"
+    discovery_prefix: "str"
+    client_id: "str"
+  logging:
+    level: "list(debug|info|warning|error)"
+    dump_raw_xml: "bool"
