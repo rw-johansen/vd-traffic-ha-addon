@@ -119,6 +119,7 @@ class TrafficEvent:
     version_time: Optional[str]
     start_time: Optional[str]
     end_time: Optional[str]
+    severity: Optional[str]
     comment: Optional[str]
     location_description: Optional[str]
     # Koordinater gemmes som den oprindelige tekst fra XML'en (ikke som
@@ -129,7 +130,12 @@ class TrafficEvent:
     longitude: Optional[str]
     latitude_num: Optional[float]
     longitude_num: Optional[float]
-    raw_extra: dict[str, Any] = field(default_factory=dict)
+    # Type-specifikke felter (fx accidentType, vehicleObstructionType,
+    # roadMaintenanceType) — navngivningen varierer per hændelsestype
+    # ifølge TRACÉ-protokolbeskrivelsen, så vi indsamler dem generisk i
+    # stedet for at hardkode hvert feltnavn.
+    extra_fields: dict[str, str] = field(default_factory=dict)
+
 
     @property
     def is_active(self) -> bool:
@@ -150,6 +156,48 @@ class TrafficEvent:
     def situation_uid(self) -> str:
         sid = self.situation_id or self.record_id or "ukendt"
         return "".join(c if c.isalnum() else "_" for c in sid)
+
+
+# Direkte børn af situationRecord der allerede håndteres eksplicit andre
+# steder — resten af de simple (blad-)børn er type-specifikke felter
+# (fx accidentType, vehicleObstructionType, roadMaintenanceType, alive,
+# temporarySpeedLimit) som vi indsamler generisk i stedet for at
+# hardkode hvert feltnavn pr. hændelsestype.
+_KNOWN_RECORD_CHILD_TAGS = {
+    "situationRecordCreationTime",
+    "situationRecordVersionTime",
+    "probabilityOfOccurrence",
+    "severity",
+    "safetyRelatedMessage",
+    "source",
+    "validity",
+    "impact",
+    "cause",
+    "generalPublicComment",
+    "locationReference",
+}
+
+
+def _extract_extra_fields(record: ET.Element) -> dict[str, str]:
+    """Indsamler simple (tekst-)værdier fra direkte børn der ikke allerede
+    håndteres andre steder — typisk det type-specifikke felt som
+    TRACÉ tilføjer pr. hændelsestype (fx sit:accidentType)."""
+    extra: dict[str, str] = {}
+    for child in list(record):
+        local = _local(child.tag)
+        if local in _KNOWN_RECORD_CHILD_TAGS:
+            continue
+        text = _text(child)
+        if text is not None:
+            extra[local] = text
+        elif len(child) == 0:
+            continue
+        else:
+            # Simpelt sammensat felt (fx visibility/delays under et andet
+            # navn) — spring over her; sensorens 'records'-attribut har
+            # stadig den fulde record_type til at slå detaljer op i loggen.
+            continue
+    return extra
 
 
 def _extract_location(record: ET.Element) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float], Optional[float]]:
@@ -245,6 +293,7 @@ def parse_datex_message(root: ET.Element) -> list[TrafficEvent]:
                         comment_parts.append(text)
 
             location_description, lat_str, lon_str, lat_num, lon_num = _extract_location(record)
+            extra_fields = _extract_extra_fields(record)
 
             events.append(
                 TrafficEvent(
@@ -256,12 +305,14 @@ def parse_datex_message(root: ET.Element) -> list[TrafficEvent]:
                     version_time=_first_text(record, "situationRecordVersionTime"),
                     start_time=_first_text(record, "overallStartTime"),
                     end_time=_first_text(record, "overallEndTime"),
+                    severity=_first_text(record, "severity"),
                     comment="; ".join(comment_parts) if comment_parts else None,
                     location_description=location_description,
                     latitude=lat_str,
                     longitude=lon_str,
                     latitude_num=lat_num,
                     longitude_num=lon_num,
+                    extra_fields=extra_fields,
                 )
             )
 
@@ -430,6 +481,7 @@ class HaMqttPublisher:
                 "version_time": r.version_time,
                 "start_time": r.start_time,
                 "end_time": r.end_time,
+                "severity": r.severity,
                 "comment": r.comment,
                 "location_description": r.location_description,
                 # Fuld original præcision som streng, så HA's frontend
@@ -437,6 +489,8 @@ class HaMqttPublisher:
                 "latitude": r.latitude,
                 "longitude": r.longitude,
                 "is_active": (not force_closed) and r.is_active,
+                # Type-specifikke felter, fx accidentType, roadMaintenanceType.
+                **r.extra_fields,
             }
             for r in records.values()
         ]
