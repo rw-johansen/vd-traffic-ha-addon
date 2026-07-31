@@ -44,21 +44,26 @@ send eksempler på den rå XML videre, så justeres parseren.
 
 ## Sensorer og kort
 
-- **Én sensor pr. hændelse** (situation) i Home Assistant, uanset hvor
-  mange DATEX II-underrecords (Accident/RoadOrCarriagewayOrLaneManagement/
-  Conditions/osv.) den består af. Alle underrecords ligger som en liste
-  i sensorens `records`-attribut.
+- **Én samlet sensor** (`sensor.vd_traffikhaendelser`) for alle hændelser
+  — state er antal aktive hændelser, og alle detaljer (per hændelse,
+  med alle DATEX II-underrecords) ligger som en liste i attributten
+  `active_events`. Det undgår at der ophobes én permanent entitet pr.
+  hændelse nogensinde (som den tidligere model gjorde).
 - Koordinater publiceres som **tekst i fuld original præcision** i
-  sensorens attributter (`latitude`/`longitude`), så Home Assistants
-  frontend ikke afrunder dem ved visning.
+  attributterne, så Home Assistants frontend ikke afrunder dem ved
+  visning.
 - Aktive hændelser med kendte koordinater vises desuden automatisk på
   Home Assistants **indbyggede kort-dashboard** (Oversigt → Kort, eller
   en Map-widget) — de oprettes som `device_tracker`-entiteter og
-  fjernes igen automatisk når hændelsen lukkes.
+  fjernes automatisk fra HA igen når hændelsen lukkes (selv-oprensende,
+  vokser ikke over tid).
 
-## Kendte begrænsninger (v0.2.0)
+## Kendte begrænsninger (v0.4.0)
 
-- Ingen geografisk filtrering — alle hændelser fra feedet publiceres
+- Ingen geografisk filtrering — alle hændelser fra feedet indgår i
+  sammendraget. Med mange samtidige landsdækkende hændelser kan
+  `active_events`-attributten blive stor; områdefiltrering (når den
+  tilføjes) vil naturligt gøre listen mindre og mere relevant
 - State genoprettes ikke fra en gemt tilstand ved genstart — kun nye
   beskeder fra feedet efter start
 - `device_tracker`-tilgangen til kortvisning er en pragmatisk løsning

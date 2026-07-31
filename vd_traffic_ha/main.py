@@ -329,6 +329,20 @@ def parse_datex_message(root: ET.Element) -> list[TrafficEvent]:
 # --------------------------------------------------------------------------- #
 
 class HaMqttPublisher:
+    """Publicerer VD-trafikhændelser til MQTT.
+
+    I stedet for én sensor-entitet pr. hændelse (som vokser ubegrænset
+    over tid, da lukkede hændelser aldrig fjernes), publiceres alle
+    hændelser samlet i ÉN sensors attributter. Sensorens state er
+    antallet af aktive hændelser.
+
+    Aktive hændelser med kendte koordinater holdes desuden som
+    individuelle MQTT device_tracker-entiteter, så de kan vises på
+    Home Assistants indbyggede kort — de er selv-oprensende (fjernes
+    helt fra HA når hændelsen lukkes), så de bidrager ikke til samme
+    vækst-problem som de gamle per-hændelse-sensorer gjorde.
+    """
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.base_topic = cfg["base_topic"].rstrip("/")
@@ -341,8 +355,8 @@ class HaMqttPublisher:
 
         # situation_id -> { record_uid: TrafficEvent }
         self._situations: dict[str, dict[str, TrafficEvent]] = {}
-        self._known_sensor_ids: set[str] = set()
         self._known_tracker_ids: set[str] = set()
+        self._summary_discovered = False
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -361,23 +375,24 @@ class HaMqttPublisher:
         self.client.loop_stop()
         self.client.disconnect()
 
-    # -- sensor (én pr. situation) ------------------------------------- #
+    # -- samlet sensor (én for alle hændelser) --------------------------- #
 
-    def _ensure_sensor_discovery(self, situation_uid: str, name: str):
-        if situation_uid in self._known_sensor_ids:
+    def _ensure_summary_discovery(self):
+        if self._summary_discovered:
             return
-        self._known_sensor_ids.add(situation_uid)
+        self._summary_discovered = True
 
-        object_id = f"vd_traffic_{situation_uid}"
+        object_id = "vd_traffic_summary"
         config_topic = f"{self.discovery_prefix}/sensor/{object_id}/config"
-        state_topic = f"{self.base_topic}/{situation_uid}/state"
-        attr_topic = f"{self.base_topic}/{situation_uid}/attributes"
+        state_topic = f"{self.base_topic}/summary/state"
+        attr_topic = f"{self.base_topic}/summary/attributes"
 
         payload = {
-            "name": name,
+            "name": "VD Trafikhændelser",
             "unique_id": object_id,
             "state_topic": state_topic,
             "json_attributes_topic": attr_topic,
+            "unit_of_measurement": "hændelser",
             "icon": "mdi:alert-octagon-outline",
             "device": {
                 "identifiers": ["vd_traffic_bridge"],
@@ -387,6 +402,64 @@ class HaMqttPublisher:
             },
         }
         self.client.publish(config_topic, json.dumps(payload), retain=True)
+
+    def _publish_summary(self):
+        self._ensure_summary_discovery()
+        state_topic = f"{self.base_topic}/summary/state"
+        attr_topic = f"{self.base_topic}/summary/attributes"
+
+        active_events = []
+        for situation_uid, records in self._situations.items():
+            if not any(r.is_active for r in records.values()):
+                continue
+            active_events.append(self._situation_summary_dict(situation_uid, records))
+
+        attributes = {
+            "active_events": active_events,
+            "updated": datetime.now(timezone.utc).isoformat(),
+        }
+
+        self.client.publish(state_topic, str(len(active_events)), retain=True)
+        self.client.publish(attr_topic, json.dumps(attributes), retain=True)
+        log.info("Publicerede sammendrag: %d aktive hændelse(r)", len(active_events))
+
+    @staticmethod
+    def _situation_summary_dict(situation_uid: str, records: dict[str, TrafficEvent]) -> dict:
+        named_record = next(
+            (r for r in sorted(records.values(), key=lambda r: r.version_time or "", reverse=True)
+             if r.location_description),
+            next(iter(records.values())),
+        )
+        coord_record = next((r for r in records.values() if r.latitude and r.longitude), None)
+        record_list = [
+            {
+                "record_id": r.record_id,
+                "record_type": r.record_type,
+                "version": r.version,
+                "creation_time": r.creation_time,
+                "version_time": r.version_time,
+                "start_time": r.start_time,
+                "end_time": r.end_time,
+                "severity": r.severity,
+                "comment": r.comment,
+                "location_description": r.location_description,
+                # Fuld original præcision som streng, så HA's frontend
+                # ikke afrunder koordinaterne ved visning.
+                "latitude": r.latitude,
+                "longitude": r.longitude,
+                "is_active": r.is_active,
+                # Type-specifikke felter, fx accidentType, roadMaintenanceType.
+                **r.extra_fields,
+            }
+            for r in records.values()
+        ]
+        return {
+            "situation_id": next(iter(records.values())).situation_id,
+            "location_description": named_record.location_description,
+            "latitude": coord_record.latitude if coord_record else None,
+            "longitude": coord_record.longitude if coord_record else None,
+            "records": record_list,
+        }
 
     # -- device_tracker (kun for aktive hændelser med koordinater) ----- #
 
@@ -430,7 +503,8 @@ class HaMqttPublisher:
     def publish_event(self, event: TrafficEvent):
         situation_uid = event.situation_uid
         self._situations.setdefault(situation_uid, {})[event.record_uid] = event
-        self._publish_situation(situation_uid)
+        self._sync_tracker(situation_uid)
+        self._publish_summary()
 
     def close_situation(self, situation_id: str):
         """Marker en hel situation som lukket ud fra en luk-notifikation.
@@ -438,84 +512,34 @@ class HaMqttPublisher:
         Bruges når Vejdirektoratet sender en 'informationManagement'
         luk-notifikation uden fuld situationRecord-data. Hvis vi ikke har
         set situationen før (fx efter en genstart af broen), er der ikke
-        noget at gøre — sensoren blev aldrig oprettet.
+        noget at gøre.
         """
         situation_uid = "".join(c if c.isalnum() else "_" for c in situation_id)
         records = self._situations.get(situation_uid)
         if not records:
             log.debug(
-                "Luk-notifikation for ukendt situation %s (ingen sensor at opdatere)",
+                "Luk-notifikation for ukendt situation %s (ingen data at opdatere)",
                 situation_id,
             )
             return
         for record in records.values():
             record.end_time = record.end_time or datetime.now(timezone.utc).isoformat()
-        self._publish_situation(situation_uid, force_closed=True)
+        self._sync_tracker(situation_uid)
+        self._publish_summary()
         log.info("Lukkede situation %s (%d record(er))", situation_id, len(records))
 
-    def _publish_situation(self, situation_uid: str, force_closed: bool = False):
+    def _sync_tracker(self, situation_uid: str):
+        """Opretter/fjerner kort-markøren for en situation ud fra dens aktuelle status."""
         records = self._situations.get(situation_uid)
         if not records:
             return
+        any_active = any(r.is_active for r in records.values())
+        coord_record = next((r for r in records.values() if r.latitude_num is not None), None)
 
-        any_active = (not force_closed) and any(r.is_active for r in records.values())
-        # Nyeste record med en lokationsbeskrivelse bruges til sensorens navn
-        named_record = next(
-            (r for r in sorted(records.values(), key=lambda r: r.version_time or "", reverse=True)
-             if r.location_description),
-            next(iter(records.values())),
-        )
-        short_id = situation_uid[:8]
-        name = f"VD {named_record.location_description or 'Trafikhændelse'} ({short_id})"
-
-        self._ensure_sensor_discovery(situation_uid, name)
-        state_topic = f"{self.base_topic}/{situation_uid}/state"
-        attr_topic = f"{self.base_topic}/{situation_uid}/attributes"
-
-        record_list = [
-            {
-                "record_id": r.record_id,
-                "record_type": r.record_type,
-                "version": r.version,
-                "creation_time": r.creation_time,
-                "version_time": r.version_time,
-                "start_time": r.start_time,
-                "end_time": r.end_time,
-                "severity": r.severity,
-                "comment": r.comment,
-                "location_description": r.location_description,
-                # Fuld original præcision som streng, så HA's frontend
-                # ikke afrunder koordinaterne ved visning.
-                "latitude": r.latitude,
-                "longitude": r.longitude,
-                "is_active": (not force_closed) and r.is_active,
-                # Type-specifikke felter, fx accidentType, roadMaintenanceType.
-                **r.extra_fields,
-            }
-            for r in records.values()
-        ]
-        # Koordinater til sensorens topniveau-attributter: første record
-        # der faktisk har dem.
-        coord_record = next((r for r in records.values() if r.latitude and r.longitude), None)
-
-        attributes = {
-            "situation_id": next(iter(records.values())).situation_id,
-            "latitude": coord_record.latitude if coord_record else None,
-            "longitude": coord_record.longitude if coord_record else None,
-            "location_description": named_record.location_description,
-            "records": record_list,
-        }
-
-        state = "active" if any_active else "closed"
-        self.client.publish(state_topic, state, retain=True)
-        self.client.publish(attr_topic, json.dumps(attributes), retain=True)
-        log.info(
-            "Publicerede situation %s: status=%s (%d record(er))",
-            situation_uid, state, len(records),
-        )
-
-        # Device_tracker (kort-visning): kun mens aktiv og med koordinater.
-        if any_active and coord_record and coord_record.latitude_num is not None:
+        if any_active and coord_record:
+            summary = self._situation_summary_dict(situation_uid, records)
+            short_id = situation_uid[:8]
+            name = f"VD {summary['location_description'] or 'Trafikhændelse'} ({short_id})"
             self._ensure_tracker_discovery(situation_uid, name)
             tracker_state_topic = f"{self.base_topic}/{situation_uid}/tracker_state"
             tracker_attr_topic = f"{self.base_topic}/{situation_uid}/tracker_attributes"
@@ -531,7 +555,6 @@ class HaMqttPublisher:
             )
         else:
             self._remove_tracker(situation_uid)
-
 
 # --------------------------------------------------------------------------- #
 # AMQP receive loop
