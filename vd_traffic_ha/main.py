@@ -226,6 +226,20 @@ def _extract_location(record: ET.Element) -> tuple[Optional[str], Optional[str],
         if lat_elems and lon_elems:
             lat_str = _text(lat_elems[0])
             lon_str = _text(lon_elems[0])
+    if lat_str is None or lon_str is None:
+        # LinearLocation-hændelser (fx en vejstrækning) angiver ofte kun
+        # koordinater som en 'posList' — en enkelt tekststreng med
+        # skiftevis lat/lon adskilt af mellemrum, uden separate
+        # latitude/longitude-elementer. Brug første koordinatpar som
+        # repræsentativt punkt.
+        for pos_list_elem in _find_all(record, "posList"):
+            text = _text(pos_list_elem)
+            if not text:
+                continue
+            parts = text.split()
+            if len(parts) >= 2:
+                lat_str, lon_str = parts[0], parts[1]
+                break
 
     lat_num = lon_num = None
     try:
@@ -374,6 +388,51 @@ class HaMqttPublisher:
     def disconnect(self):
         self.client.loop_stop()
         self.client.disconnect()
+
+    def purge_stale_entities(self, wait_seconds: float = 3.0):
+        """Rydder retained MQTT-discovery-beskeder fra tidligere kørsler.
+
+        Broen holder kun styr på kendte sensorer/trackere i hukommelsen,
+        så efter en genstart (eller en helt ny Home Assistant-installation
+        mod samme broker) aner den ikke hvilke gamle vd_traffic-entiteter
+        der stadig ligger som retained beskeder på broker'en — de bliver
+        derfor aldrig fjernet af sig selv. Denne funktion lytter kort
+        efter dem ved opstart og afregistrerer dem, så vi starter med en
+        ren tavle hver gang. Normal drift genopretter herefter kun de
+        sensorer/trackere der rent faktisk er aktive lige nu.
+        """
+        found_topics: set[str] = set()
+
+        def _on_message(client, userdata, msg):
+            if msg.payload:  # tomme (allerede-slettede) beskeder ignoreres
+                found_topics.add(msg.topic)
+
+        previous_handler = self.client.on_message
+        self.client.on_message = _on_message
+
+        wildcard_topics = [
+            f"{self.discovery_prefix}/sensor/vd_traffic_+/config",
+            f"{self.discovery_prefix}/device_tracker/vd_traffic_loc_+/config",
+        ]
+        for topic in wildcard_topics:
+            self.client.subscribe(topic)
+
+        time.sleep(wait_seconds)
+
+        for topic in wildcard_topics:
+            self.client.unsubscribe(topic)
+        self.client.on_message = previous_handler
+
+        for topic in found_topics:
+            self.client.publish(topic, "", retain=True)
+
+        if found_topics:
+            log.info(
+                "Ryddede %d gamle vd_traffic-entitet(er) fra tidligere kørsler",
+                len(found_topics),
+            )
+        else:
+            log.info("Ingen gamle vd_traffic-entiteter fundet ved opstart")
 
     # -- samlet sensor (én for alle hændelser) --------------------------- #
 
@@ -588,6 +647,7 @@ def run(config_path: str):
 
     publisher = HaMqttPublisher(cfg["mqtt"])
     publisher.connect()
+    publisher.purge_stale_entities()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
