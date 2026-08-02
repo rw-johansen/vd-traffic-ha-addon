@@ -440,15 +440,24 @@ class HaMqttPublisher:
         found_topics: set[str] = set()
 
         def _on_message(client, userdata, msg):
-            if msg.payload:  # tomme (allerede-slettede) beskeder ignoreres
+            if not msg.payload:
+                return  # tomme (allerede-slettede) beskeder ignoreres
+            # MQTT-wildcards kan kun matche et helt topic-niveau (+ må ikke
+            # bruges som prefix inde i et niveau, fx 'vd_traffic_+' er
+            # ugyldigt) — vi abonnerer derfor bredt på alle sensor/
+            # device_tracker discovery-topics og filtrerer selv på
+            # object_id-niveau i Python.
+            parts = msg.topic.split("/")
+            object_id = parts[-2] if len(parts) >= 2 else ""
+            if object_id.startswith("vd_traffic"):
                 found_topics.add(msg.topic)
 
         previous_handler = self.client.on_message
         self.client.on_message = _on_message
 
         wildcard_topics = [
-            f"{self.discovery_prefix}/sensor/vd_traffic_+/config",
-            f"{self.discovery_prefix}/device_tracker/vd_traffic_loc_+/config",
+            f"{self.discovery_prefix}/sensor/+/config",
+            f"{self.discovery_prefix}/device_tracker/+/config",
         ]
         for topic in wildcard_topics:
             self.client.subscribe(topic)
@@ -740,41 +749,48 @@ def run(config_path: str):
                 ) as receiver:
                     log.info("Forbundet til AMQP-feed, venter på beskeder...")
                     backoff = 5  # reset efter succesfuld forbindelse
-                    for msg in receiver:
-                        if _shutdown:
-                            break
-                        try:
-                            body = b"".join(msg.body) if hasattr(msg, "body") else bytes(msg)
-                            if dump_raw_xml:
-                                log.debug("Rå DATEX II XML:\n%s", body.decode("utf-8", "replace"))
-
-                            root = parse_datex_root(body)
-                            if root is None:
-                                receiver.complete_message(msg)
-                                continue
-
-                            events = parse_datex_message(root)
-                            closed_situation_ids = parse_close_notifications(root)
-
-                            for event in events:
-                                publisher.publish_event(event)
-                            for situation_id in closed_situation_ids:
-                                publisher.close_situation(situation_id)
-
-                            if not events and not closed_situation_ids:
-                                log.warning(
-                                    "Ukendt beskedformat — hverken hændelser "
-                                    "eller luk-notifikation fundet. Sæt "
-                                    "dump_raw_xml: true i opsætningen for at "
-                                    "undersøge strukturen."
-                                )
-                            receiver.complete_message(msg)
-                        except Exception:
-                            log.exception("Fejl under behandling af besked — springer over")
+                    # 'for msg in receiver' afslutter sig selv efter
+                    # max_wait_time sekunder uden nye beskeder — uden dette
+                    # ydre while-loop ville det udløse en fuld reconnect
+                    # (ny forbindelse + re-autentificering) hver gang feedet
+                    # er stille i 30 sekunder. Her genoptager vi i stedet
+                    # blot iterationen på den samme, stadig-åbne forbindelse.
+                    while not _shutdown:
+                        for msg in receiver:
+                            if _shutdown:
+                                break
                             try:
-                                receiver.abandon_message(msg)
+                                body = b"".join(msg.body) if hasattr(msg, "body") else bytes(msg)
+                                if dump_raw_xml:
+                                    log.debug("Rå DATEX II XML:\n%s", body.decode("utf-8", "replace"))
+
+                                root = parse_datex_root(body)
+                                if root is None:
+                                    receiver.complete_message(msg)
+                                    continue
+
+                                events = parse_datex_message(root)
+                                closed_situation_ids = parse_close_notifications(root)
+
+                                for event in events:
+                                    publisher.publish_event(event)
+                                for situation_id in closed_situation_ids:
+                                    publisher.close_situation(situation_id)
+
+                                if not events and not closed_situation_ids:
+                                    log.warning(
+                                        "Ukendt beskedformat — hverken hændelser "
+                                        "eller luk-notifikation fundet. Sæt "
+                                        "dump_raw_xml: true i opsætningen for at "
+                                        "undersøge strukturen."
+                                    )
+                                receiver.complete_message(msg)
                             except Exception:
-                                pass
+                                log.exception("Fejl under behandling af besked — springer over")
+                                try:
+                                    receiver.abandon_message(msg)
+                                except Exception:
+                                    pass
         except ServiceBusError:
             log.exception("AMQP-forbindelsesfejl — prøver igen om %ss", backoff)
             time.sleep(backoff)
