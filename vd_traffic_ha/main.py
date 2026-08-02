@@ -32,6 +32,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -120,6 +121,14 @@ class TrafficEvent:
     start_time: Optional[str]
     end_time: Optional[str]
     severity: Optional[str]
+    probability_of_occurrence: Optional[str]
+    safety_related_message: Optional[str]
+    cause_type: Optional[str]
+    number_of_operational_lanes: Optional[str]
+    residual_lane_width: Optional[str]
+    delay_band: Optional[str]
+    delay_time_value: Optional[str]
+    visibility_distance_m: Optional[str]
     comment: Optional[str]
     location_description: Optional[str]
     # Koordinater gemmes som den oprindelige tekst fra XML'en (ikke som
@@ -198,6 +207,24 @@ def _extract_extra_fields(record: ET.Element) -> dict[str, str]:
             # stadig den fulde record_type til at slå detaljer op i loggen.
             continue
     return extra
+
+
+def _extract_meta_fields(record: ET.Element) -> dict[str, Optional[str]]:
+    """Udtrækker felter der er indlejrede (ikke simple bladelementer), og
+    derfor ikke fanges af _extract_extra_fields: probabilityOfOccurrence,
+    safetyRelatedMessage, cause/causeType, impact (antal spor, forsinkelse)
+    og visibility (sigtbarhed for PoorEnvironmentConditions)."""
+    result: dict[str, Optional[str]] = {
+        "probability_of_occurrence": _first_text(record, "probabilityOfOccurrence"),
+        "safety_related_message": _first_text(record, "safetyRelatedMessage"),
+        "cause_type": _first_text(record, "causeType"),
+        "number_of_operational_lanes": _first_text(record, "numberOfOperationalLanes"),
+        "residual_lane_width": _first_text(record, "residualLaneWidth"),
+        "delay_band": _first_text(record, "delayBand"),
+        "delay_time_value": _first_text(record, "delayTimeValue"),
+        "visibility_distance_m": _first_text(record, "integerMetreDistance"),
+    }
+    return result
 
 
 def _extract_location(record: ET.Element) -> tuple[Optional[str], Optional[str], Optional[str], Optional[float], Optional[float]]:
@@ -308,6 +335,7 @@ def parse_datex_message(root: ET.Element) -> list[TrafficEvent]:
 
             location_description, lat_str, lon_str, lat_num, lon_num = _extract_location(record)
             extra_fields = _extract_extra_fields(record)
+            meta = _extract_meta_fields(record)
 
             events.append(
                 TrafficEvent(
@@ -320,6 +348,14 @@ def parse_datex_message(root: ET.Element) -> list[TrafficEvent]:
                     start_time=_first_text(record, "overallStartTime"),
                     end_time=_first_text(record, "overallEndTime"),
                     severity=_first_text(record, "severity"),
+                    probability_of_occurrence=meta["probability_of_occurrence"],
+                    safety_related_message=meta["safety_related_message"],
+                    cause_type=meta["cause_type"],
+                    number_of_operational_lanes=meta["number_of_operational_lanes"],
+                    residual_lane_width=meta["residual_lane_width"],
+                    delay_band=meta["delay_band"],
+                    delay_time_value=meta["delay_time_value"],
+                    visibility_distance_m=meta["visibility_distance_m"],
                     comment="; ".join(comment_parts) if comment_parts else None,
                     location_description=location_description,
                     latitude=lat_str,
@@ -500,6 +536,14 @@ class HaMqttPublisher:
                 "start_time": r.start_time,
                 "end_time": r.end_time,
                 "severity": r.severity,
+                "probability_of_occurrence": r.probability_of_occurrence,
+                "safety_related_message": r.safety_related_message,
+                "cause_type": r.cause_type,
+                "number_of_operational_lanes": r.number_of_operational_lanes,
+                "residual_lane_width": r.residual_lane_width,
+                "delay_band": r.delay_band,
+                "delay_time_value": r.delay_time_value,
+                "visibility_distance_m": r.visibility_distance_m,
                 "comment": r.comment,
                 "location_description": r.location_description,
                 # Fuld original præcision som streng, så HA's frontend
@@ -564,6 +608,23 @@ class HaMqttPublisher:
         self._situations.setdefault(situation_uid, {})[event.record_uid] = event
         self._sync_tracker(situation_uid)
         self._publish_summary()
+
+    def resync_all(self):
+        """Genberegner status for ALLE kendte situationer, ikke kun den der
+        senest fik en ny besked.
+
+        'is_active' afhænger af nutidens klokkeslæt vs. overallEndTime —
+        en hændelse kan altså gå fra aktiv til udløbet uden at der
+        nogensinde kommer en ny besked om netop den. Sammendrags-sensoren
+        beregnes allerede frisk hver gang, men kort-trackere opdateres kun
+        når deres situation selv får en ny besked — uden dette periodiske
+        kald ville udløbne trackere blive hængende for evigt. Kaldes fra
+        en baggrundstråd med jævne mellemrum, se run().
+        """
+        for situation_uid in list(self._situations.keys()):
+            self._sync_tracker(situation_uid)
+        self._publish_summary()
+        log.debug("Periodisk resync gennemført (%d kendte situationer)", len(self._situations))
 
     def close_situation(self, situation_id: str):
         """Marker en hel situation som lukket ud fra en luk-notifikation.
@@ -648,6 +709,18 @@ def run(config_path: str):
     publisher = HaMqttPublisher(cfg["mqtt"])
     publisher.connect()
     publisher.purge_stale_entities()
+
+    def _periodic_resync(interval_seconds: float = 120.0):
+        while not _shutdown:
+            time.sleep(interval_seconds)
+            if _shutdown:
+                break
+            try:
+                publisher.resync_all()
+            except Exception:
+                log.exception("Fejl under periodisk resync")
+
+    threading.Thread(target=_periodic_resync, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
