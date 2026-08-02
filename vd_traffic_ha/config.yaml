@@ -1,5 +1,5 @@
 name: "VD Trafikhændelser"
-version: "0.7.0"
+version: "0.7.1"
 slug: "vd_traffic_ha"
 description: "Modtager Vejdirektoratets trafikhændelser via AMQP og publicerer dem til MQTT med Home Assistant auto-discovery"
 url: "https://github.com/rw-johansen/vd-traffic-ha-addon"

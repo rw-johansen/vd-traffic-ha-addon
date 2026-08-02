@@ -84,6 +84,7 @@ class ReverseGeocoder:
         key = self._cache_key(lat, lon)
         with self._lock:
             if key in self._cache:
+                log.debug("Geocoding cache-hit for %s -> %r", key, self._cache[key])
                 return self._cache[key]
 
             wait = _NOMINATIM_MIN_INTERVAL - (time.time() - self._last_request)
@@ -93,6 +94,10 @@ class ReverseGeocoder:
             result = self._fetch(lat, lon)
             self._last_request = time.time()
             self._cache[key] = result
+            if result:
+                log.info("Geocodede %s -> %r", key, result)
+            else:
+                log.info("Kunne ikke geocode %s (se DEBUG-log for detaljer)", key)
             return result
 
     @staticmethod
@@ -787,10 +792,15 @@ def run(config_path: str):
     cfg = load_config(config_path)
 
     log_level = str(cfg.get("logging", {}).get("level", "info")).upper()
+    # Roden sættes til WARNING så tredjeparts-biblioteker (Azure SDK'et er
+    # særligt pratsomt — dets 'cbs'-statustjek logger flere gange i
+    # sekundet på DEBUG-niveau) ikke drukner vores egne beskeder. Kun
+    # vd-traffic-ha-loggeren selv følger den konfigurerede level.
     logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
+        level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    log.setLevel(getattr(logging, log_level, logging.INFO))
     dump_raw_xml = bool(cfg.get("logging", {}).get("dump_raw_xml", False))
 
     az = cfg["azure"]
