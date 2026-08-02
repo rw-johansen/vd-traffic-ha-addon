@@ -1,5 +1,5 @@
 name: "VD Trafikhændelser"
-version: "0.6.1"
+version: "0.7.0"
 slug: "vd_traffic_ha"
 description: "Modtager Vejdirektoratets trafikhændelser via AMQP og publicerer dem til MQTT med Home Assistant auto-discovery"
 url: "https://github.com/rw-johansen/vd-traffic-ha-addon"
@@ -31,6 +31,8 @@ options:
   logging:
     level: "info"
     dump_raw_xml: false
+  geocoding:
+    enabled: true
 schema:
   azure:
     tenant_id: "str"
@@ -50,3 +52,5 @@ schema:
   logging:
     level: "list(debug|info|warning|error)"
     dump_raw_xml: "bool"
+  geocoding:
+    enabled: "bool"

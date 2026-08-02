@@ -34,6 +34,9 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -46,6 +49,78 @@ from azure.servicebus import ServiceBusClient, ServiceBusReceiveMode
 from azure.servicebus.exceptions import ServiceBusError
 
 log = logging.getLogger("vd-traffic-ha")
+
+
+# --------------------------------------------------------------------------- #
+# Reverse geocoding (fallback for hændelser uden location_description)
+#
+# Bruger OpenStreetMap Nominatim, som er gratis og ikke kræver en API-nøgle.
+# Nominatims brugsvilkår kræver: en identificerende User-Agent, og højst ét
+# opslag i sekundet — begge dele overholdes her. Resultater caches i
+# hukommelsen (afrundet til ~100m) så vi aldrig slår den samme lokation op
+# to gange i én kørsel.
+# --------------------------------------------------------------------------- #
+
+_NOMINATIM_USER_AGENT = "vd-traffic-ha-addon/1.0 (Home Assistant integration)"
+_NOMINATIM_MIN_INTERVAL = 1.1  # sekunder mellem opslag, jf. Nominatims brugsvilkår
+
+
+class ReverseGeocoder:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._cache: dict[str, Optional[str]] = {}
+        self._last_request = 0.0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _cache_key(lat: float, lon: float) -> str:
+        # ~3 decimaler svarer til ca. 100 meters præcision — rigeligt til
+        # en fornuftig stedbeskrivelse, og holder cachen effektiv.
+        return f"{lat:.3f},{lon:.3f}"
+
+    def resolve(self, lat: float, lon: float) -> Optional[str]:
+        if not self.enabled:
+            return None
+        key = self._cache_key(lat, lon)
+        with self._lock:
+            if key in self._cache:
+                return self._cache[key]
+
+            wait = _NOMINATIM_MIN_INTERVAL - (time.time() - self._last_request)
+            if wait > 0:
+                time.sleep(wait)
+
+            result = self._fetch(lat, lon)
+            self._last_request = time.time()
+            self._cache[key] = result
+            return result
+
+    @staticmethod
+    def _fetch(lat: float, lon: float) -> Optional[str]:
+        params = urllib.parse.urlencode({
+            "format": "jsonv2",
+            "lat": f"{lat:.6f}",
+            "lon": f"{lon:.6f}",
+            "zoom": "16",
+            "accept-language": "da",
+        })
+        url = f"https://nominatim.openstreetmap.org/reverse?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": _NOMINATIM_USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            log.debug("Reverse geocoding fejlede for %.5f,%.5f: %s", lat, lon, exc)
+            return None
+
+        addr = data.get("address", {})
+        road = addr.get("road")
+        city = addr.get("city") or addr.get("town") or addr.get("village") or addr.get("municipality")
+        if road and city:
+            return f"{road}, {city}"
+        if road:
+            return road
+        return data.get("display_name")
 
 
 # --------------------------------------------------------------------------- #
@@ -393,7 +468,7 @@ class HaMqttPublisher:
     vækst-problem som de gamle per-hændelse-sensorer gjorde.
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, geocoding_enabled: bool = True):
         self.cfg = cfg
         self.base_topic = cfg["base_topic"].rstrip("/")
         self.discovery_prefix = cfg["discovery_prefix"].rstrip("/")
@@ -407,6 +482,7 @@ class HaMqttPublisher:
         self._situations: dict[str, dict[str, TrafficEvent]] = {}
         self._known_tracker_ids: set[str] = set()
         self._summary_discovered = False
+        self.geocoder = ReverseGeocoder(enabled=geocoding_enabled)
 
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
@@ -527,14 +603,22 @@ class HaMqttPublisher:
         self.client.publish(attr_topic, json.dumps(attributes), retain=True)
         log.info("Publicerede sammendrag: %d aktive hændelse(r)", len(active_events))
 
-    @staticmethod
-    def _situation_summary_dict(situation_uid: str, records: dict[str, TrafficEvent]) -> dict:
+    def _situation_summary_dict(self, situation_uid: str, records: dict[str, TrafficEvent]) -> dict:
         named_record = next(
             (r for r in sorted(records.values(), key=lambda r: r.version_time or "", reverse=True)
              if r.location_description),
             next(iter(records.values())),
         )
         coord_record = next((r for r in records.values() if r.latitude and r.longitude), None)
+
+        location_description = named_record.location_description
+        geocoded = False
+        if not location_description and coord_record and coord_record.latitude_num is not None:
+            location_description = self.geocoder.resolve(
+                coord_record.latitude_num, coord_record.longitude_num
+            )
+            geocoded = location_description is not None
+
         record_list = [
             {
                 "record_id": r.record_id,
@@ -567,7 +651,8 @@ class HaMqttPublisher:
         ]
         return {
             "situation_id": next(iter(records.values())).situation_id,
-            "location_description": named_record.location_description,
+            "location_description": location_description,
+            "location_description_geocoded": geocoded,
             "latitude": coord_record.latitude if coord_record else None,
             "longitude": coord_record.longitude if coord_record else None,
             "records": record_list,
@@ -715,7 +800,8 @@ def run(config_path: str):
         client_secret=az["client_secret"],
     )
 
-    publisher = HaMqttPublisher(cfg["mqtt"])
+    geocoding_enabled = bool(cfg.get("geocoding", {}).get("enabled", True))
+    publisher = HaMqttPublisher(cfg["mqtt"], geocoding_enabled=geocoding_enabled)
     publisher.connect()
     publisher.purge_stale_entities()
 

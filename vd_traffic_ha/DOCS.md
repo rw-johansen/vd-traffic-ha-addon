@@ -57,8 +57,14 @@ send eksempler på den rå XML videre, så justeres parseren.
   en Map-widget) — de oprettes som `device_tracker`-entiteter og
   fjernes automatisk fra HA igen når hændelsen lukkes (selv-oprensende,
   vokser ikke over tid).
+- Hvis en hændelse mangler `location_description` fra Vejdirektoratet,
+  men har koordinater, slår add-on'et automatisk en stedbeskrivelse op
+  via OpenStreetMap Nominatim (reverse geocoding) og bruger den som
+  fallback. Kan slås fra under **Configuration → geocoding → enabled**.
+  Resultater caches i hukommelsen, og opslag overholder Nominatims
+  hastighedsgrænse (højst ét opslag i sekundet).
 
-## Kendte begrænsninger (v0.4.0)
+## Kendte begrænsninger (v0.7.0)
 
 - Ingen geografisk filtrering — alle hændelser fra feedet indgår i
   sammendraget. Med mange samtidige landsdækkende hændelser kan
